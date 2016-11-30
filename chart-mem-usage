@@ -1,0 +1,112 @@
+#!/usr/bin/env ruby
+require 'clamp'
+require 'date'
+
+Clamp do
+  parameter "DATA", "File with data collected from the cron job"
+  self.description = "Preprocess data for chart of memory usage. Collect the data with\n  $> echo \"0 * * * * root (date && ps aux --sort -rss | head -n20) >> output_file\" > /etc/cron.d/mem_usage"
+  option ['--filter'], 'FILTER', "Regexp matching processes included in the chart", :attribute_name => :filter_expression
+  option ['--depth'], 'DEPTH', "Process name is split by spaces first N parts are used as process name", :default => 3
+  option ['--since'], 'SINCE', "Show logs after yyyy-mm-dd [HH:MM:SS]"
+  option ['--till'], 'TILL', "Show logs before yyyy-mm-dd [HH:MM:SS]"
+  option ['--cpu'], :flag, "plot CPU usage instead of memory", :default => false
+  option ['--withpid'], :flag, "Prepend process name with pid", :default => false
+  option ['--format'], "FORMAT", "Format of the output (One of 'csv, 'gnuplot')", :default => 'csv'
+  option ['--width'], "WIDTH", "Width of the resulting image (with gnuplot only)", :default => 1200
+  option ['--height'], "HEIGHT", "Height of the resulting image (with gnuplot only)", :default => 800
+
+
+  def execute
+    actual_date = nil
+    actual_key = nil
+    mem_usage = {}
+    skip = false
+
+    since_date = DateTime.parse(since) unless since.nil?
+    till_date = DateTime.parse(till) unless till.nil?
+    since_date ||= DateTime.strptime("1",'%s')
+    till_date ||= DateTime.parse('2038-01-01')
+
+    filter = Regexp.new(filter_expression) if filter_expression
+
+    File.readlines(data).each do |line|
+      line = line.chomp
+      next if line.empty?
+      next if labels_line?(line)
+
+      if (processed_date = date_line?(line))
+        actual_date = processed_date
+        actual_key = actual_date.to_time.to_s
+        if actual_date < since_date || actual_date > till_date
+          skip = true
+        else
+          mem_usage[actual_key] = {}
+          skip = false
+        end
+        next
+      end
+      next if skip
+
+      stats = parse_line(line)
+      next if filter && !filter.match(stats[:command])
+      mem_usage[actual_key][stats[:command]] ||= 0
+      mem_usage[actual_key][stats[:command]] += (cpu? ? stats[:cpu] : stats[:rss])
+    end
+
+    processes = collect_processes(mem_usage)
+
+    if format == 'gnuplot'
+      puts "set terminal png size #{width},#{height}"
+      puts "$data << EOD"
+      puts (['Time'] + processes.map { |p| "\"#{p}\""}).join('   ')
+      mem_usage.each do |time, stats|
+        out = ["\"#{time}\""]
+        processes.each { |p| out << stats[p].to_f }
+        puts out.join('   ')
+      end
+      puts "EOD"
+      puts "set style histogram rowstacked"
+      puts "set style data histogram"
+      puts "set title \"Memory usage\""
+      puts "set grid nopolar"
+      puts "set ylabel \"#{ cpu? ? 'CPU (%)' : 'Memory (GB)' }\""
+      puts "set border 3 front lt black linewidth 1.000 dashtype solid"
+      puts "unset colorbox"
+      puts "set style fill solid 1.00 border lt -1"
+      puts "set key font \", 11\""
+      puts "set key invert out bot center Left reverse height -6"
+      puts "set xtics rotate by 60 right out"
+      puts "set xtics font \", 7\""
+      puts "plot for [COL=2:#{processes.count+1}] \"$data\" using COL:xticlabels(1) title columnheader"
+    else
+      puts (['Time'] + processes).join(',')
+      mem_usage.each do |time, stats|
+        out = [time]
+        processes.each { |p| out << stats[p].to_f }
+        puts out.join(',')
+      end
+    end
+  end
+
+  private
+
+  def date_line?(line)
+    DateTime.strptime(line, '%a %d %b %H:%M:%S %Z %Y') rescue false ||
+      DateTime.strptime(line, '%a %b %d %H:%M:%S %Z %Y') rescue false
+  end
+
+  def labels_line?(line)
+    line.start_with?("USER")
+  end
+
+  def parse_line(line)
+    split = line.split(/ +/)
+    command = split[10..10+depth.to_i-1].join(' ')
+    command = "[#{split[1]}] #{command}" if withpid?
+    { :rss => split[5].to_f/1024/1024, :cpu => split[2].to_f, :command => command}
+  end
+
+  def collect_processes(usage)
+    usage.values.inject([]) { |all, stat| (all + stat.keys).uniq }
+  end
+end
